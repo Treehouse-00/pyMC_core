@@ -396,6 +396,30 @@ class RFFabric:
                 pass
         return float(self._last_snr)
 
+    def check_radio_health(self) -> bool:
+        """Run each registered radio's health check.
+
+        Dispatcher sees the Fabric as one radio, so its periodic health check
+        must reach every physical endpoint. Besides link recovery, modem
+        health checks refresh cached metrics such as noise floor and CRC-error
+        counters.
+        """
+        if not self._radios:
+            return False
+
+        healthy = True
+        for radio_id, radio in list(self._radios.items()):
+            check = getattr(radio, "check_radio_health", None)
+            if not callable(check):
+                continue
+            try:
+                if not check():
+                    healthy = False
+            except Exception as exc:
+                healthy = False
+                logger.warning("Radio %s health check failed: %s", radio_id, exc)
+        return healthy
+
     def __getattr__(self, name: str) -> Any:
         """Attribute pass-through for radio settings used by Dispatcher."""
         if name.startswith("_"):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import Mock
 
 import pytest
 from openhop_core.node.dispatcher import Dispatcher
@@ -115,6 +116,38 @@ class TestRFFabricMultiRadio:
         assert b.rx_callback is not None
         assert list(fabric.radios.keys()) == ["rb"]
         assert fabric.default_radio_id == "rb"
+
+    def test_health_check_reaches_every_radio_and_aggregates_results(self):
+        healthy = _MockRadio("healthy")
+        unhealthy = _MockRadio("unhealthy")
+        healthy.check_radio_health = Mock(return_value=True)
+        unhealthy.check_radio_health = Mock(return_value=False)
+        fabric = RFFabric()
+        fabric.register_radio(healthy, radio_id="healthy")
+        fabric.register_radio(unhealthy, radio_id="unhealthy")
+
+        assert fabric.check_radio_health() is False
+        healthy.check_radio_health.assert_called_once_with()
+        unhealthy.check_radio_health.assert_called_once_with()
+
+    def test_health_check_isolates_child_exceptions(self, caplog):
+        broken = _MockRadio("broken")
+        healthy = _MockRadio("healthy")
+        broken.check_radio_health = Mock(side_effect=RuntimeError("offline"))
+        healthy.check_radio_health = Mock(return_value=True)
+        fabric = RFFabric()
+        fabric.register_radio(broken, radio_id="broken")
+        fabric.register_radio(healthy, radio_id="healthy")
+
+        assert fabric.check_radio_health() is False
+        healthy.check_radio_health.assert_called_once_with()
+        assert "Radio broken health check failed: offline" in caplog.text
+
+    def test_health_check_keeps_legacy_radios_compatible(self):
+        fabric = RFFabric()
+        fabric.register_radio(_MockRadio("legacy"), radio_id="legacy")
+
+        assert fabric.check_radio_health() is True
 
 
 class TestFabricRadioMulti:
