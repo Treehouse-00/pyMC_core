@@ -76,13 +76,28 @@ class TestSelectorArityDetection:
     def test_one_argument_selector_is_legacy(self):
         assert _selector_takes_rx(lambda data: None) is False
 
-    def test_two_argument_selector_takes_rx(self):
-        assert _selector_takes_rx(lambda data, rx: None) is True
+    def test_a_selector_naming_rx_radio_id_takes_rx(self):
+        assert _selector_takes_rx(lambda data, rx_radio_id: None) is True
 
-    def test_star_args_selector_takes_rx(self):
-        assert _selector_takes_rx(lambda *args: None) is True
+    def test_a_second_parameter_by_another_name_is_the_selectors_own(self):
+        # The whole reason this is name-based. Counting positionals reads this
+        # as context-aware, hands `options` a radio id in place of its default,
+        # and then rejects whatever it returns.
+        def choose(data, options=("alpha", "beta")):
+            return options[0]
 
-    def test_bound_method_does_not_count_self(self):
+        assert _selector_takes_rx(choose) is False
+
+    def test_star_args_is_not_evidence_of_intent(self):
+        assert _selector_takes_rx(lambda *args: None) is False
+
+    def test_kwargs_sponge_is_not_evidence_of_intent(self):
+        assert _selector_takes_rx(lambda data, **kwargs: None) is False
+
+    def test_keyword_only_rx_radio_id_counts(self):
+        assert _selector_takes_rx(lambda data, *, rx_radio_id=None: None) is True
+
+    def test_bound_method_is_read_by_name_too(self):
         class Policy:
             def one(self, data):
                 return None
@@ -101,7 +116,7 @@ class TestSelectorArityDetection:
 
     def test_none_clears_the_flag(self):
         fabric, _, _ = _bridge_pair()
-        fabric.set_tx_selector(lambda data, rx: "rb")
+        fabric.set_tx_selector(lambda data, rx_radio_id: "rb")
         assert fabric._tx_selector_takes_rx is True
         fabric.set_tx_selector(None)
         assert fabric._tx_selector_takes_rx is False
@@ -137,13 +152,13 @@ class TestResolveWithIngressRadio:
     def test_locally_originated_frames_pass_none(self):
         fabric, _, _ = _bridge_pair()
         seen = []
-        fabric.set_tx_selector(lambda data, rx: seen.append(rx) or None)
+        fabric.set_tx_selector(lambda data, rx_radio_id: seen.append(rx_radio_id) or None)
         assert fabric.resolve_tx_radio_id(b"f") == "ra"
         assert seen == [None]
 
     def test_explicit_radio_id_still_wins(self):
         fabric, _, _ = _bridge_pair()
-        fabric.set_tx_selector(lambda data, rx: "ra")
+        fabric.set_tx_selector(lambda data, rx_radio_id: "ra")
         assert fabric.resolve_tx_radio_id(b"f", "rb", rx_radio_id="ra") == "rb"
 
     def test_answer_holds_when_another_radio_receives_in_between(self):
@@ -152,7 +167,9 @@ class TestResolveWithIngressRadio:
         fabric, a, b = _bridge_pair()
         fabric.arm()
         fabric.set_tx_selector(
-            lambda data, rx: next((rid for rid in fabric.radios if rid != rx), None)
+            lambda data, rx_radio_id: next(
+                (rid for rid in fabric.radios if rid != rx_radio_id), None
+            )
         )
         planned = fabric.resolve_tx_radio_id(b"f", rx_radio_id="ra")
         b.rx_callback(b"someone else", -90, 1.0)
@@ -165,7 +182,9 @@ class TestSendWithIngressRadio:
     async def test_send_routes_by_ingress_radio(self):
         fabric, a, b = _bridge_pair()
         fabric.set_tx_selector(
-            lambda data, rx: next((rid for rid in fabric.radios if rid != rx), None)
+            lambda data, rx_radio_id: next(
+                (rid for rid in fabric.radios if rid != rx_radio_id), None
+            )
         )
         result = await fabric.send(b"from-a", rx_radio_id="ra")
         assert b.sent == [b"from-a"]
@@ -178,7 +197,9 @@ class TestSendWithIngressRadio:
         a, b = _MockRadio("a"), _MockRadio("b")
         fr = FabricRadio(radios=[(a, "ra"), (b, "rb")], default_radio_id="ra")
         fr.fabric.set_tx_selector(
-            lambda data, rx: next((rid for rid in fr.fabric.radios if rid != rx), None)
+            lambda data, rx_radio_id: next(
+                (rid for rid in fr.fabric.radios if rid != rx_radio_id), None
+            )
         )
         await fr.send(b"d", rx_radio_id="ra")
         assert b.sent == [b"d"]
@@ -191,7 +212,9 @@ class TestDispatcherThreadsIngressRadio:
         a, b = _MockRadio("a"), _MockRadio("b")
         fr = FabricRadio(radios=[(a, "ra"), (b, "rb")], default_radio_id="ra")
         fr.fabric.set_tx_selector(
-            lambda data, rx: next((rid for rid in fr.fabric.radios if rid != rx), None)
+            lambda data, rx_radio_id: next(
+                (rid for rid in fr.fabric.radios if rid != rx_radio_id), None
+            )
         )
         dispatcher = Dispatcher(radio=fr, packet_filter=PacketFilter())
 
@@ -207,8 +230,10 @@ class TestDispatcherThreadsIngressRadio:
         a, b = _MockRadio("a"), _MockRadio("b")
         fr = FabricRadio(radios=[(a, "ra"), (b, "rb")], default_radio_id="ra")
         fr.fabric.set_tx_selector(
-            lambda data, rx: next((rid for rid in fr.fabric.radios if rid != rx), None)
-            if rx
+            lambda data, rx_radio_id: next(
+                (rid for rid in fr.fabric.radios if rid != rx_radio_id), None
+            )
+            if rx_radio_id
             else None
         )
         dispatcher = Dispatcher(radio=fr, packet_filter=PacketFilter())
@@ -235,3 +260,54 @@ class TestDispatcherThreadsIngressRadio:
 
         assert _names_keyword(sponge, "rx_radio_id") is False
         assert _names_keyword(explicit, "rx_radio_id") is True
+
+
+class TestLegacySelectorsAreNotMisread:
+    """A one-argument selector may take arguments of its own.
+
+    Reading arity as intent classified `def choose(data, options=...)` as
+    context-aware, called it with a radio id in place of its default, and then
+    raised KeyError on whatever it returned -- losing every transmission on a
+    node that had been working.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_defaulted_second_parameter_still_gets_one_argument(self):
+        fabric, a, b = _bridge_pair()
+        calls = []
+
+        def choose(data, options=("ra", "rb")):
+            calls.append(options)
+            return options[0]
+
+        fabric.set_tx_selector(choose)
+        assert fabric.resolve_tx_radio_id(b"f", rx_radio_id="rb") == "ra"
+        assert calls == [("ra", "rb")]
+
+        await fabric.send(b"frame", rx_radio_id="rb")
+        assert a.sent == [b"frame"]
+        assert not b.sent
+
+    def test_a_star_args_selector_is_called_the_way_it_always_was(self):
+        fabric, _, _ = _bridge_pair()
+        seen = []
+
+        def anything(*args):
+            seen.append(args)
+            return "rb"
+
+        fabric.set_tx_selector(anything)
+        assert fabric.resolve_tx_radio_id(b"f", rx_radio_id="ra") == "rb"
+        assert seen == [(b"f",)]
+
+    def test_a_context_selector_receives_it_by_keyword(self):
+        fabric, _, _ = _bridge_pair()
+        seen = []
+
+        def policy(data, *, rx_radio_id=None):
+            seen.append(rx_radio_id)
+            return "rb"
+
+        fabric.set_tx_selector(policy)
+        assert fabric.resolve_tx_radio_id(b"f", rx_radio_id="ra") == "rb"
+        assert seen == ["ra"]

@@ -23,7 +23,7 @@ LegacyRxCallback = Callable[..., Any]
 # registered:
 #
 #     selector(data)                  the original shape, unchanged
-#     selector(data, rx_radio_id)     also told the radio the frame arrived on,
+#     selector(data, rx_radio_id=...) also told the radio the frame arrived on,
 #                                     or None when this node originated it
 #
 # The second shape exists so a selector can be a pure function of the packet in
@@ -32,13 +32,24 @@ LegacyRxCallback = Callable[..., Any]
 # be this packet -- on a busy dual-band node that puts traffic on the wrong
 # band. Being a pure function also means a caller can ask
 # ``resolve_tx_radio_id`` before the send and rely on the answer.
+#
+# A selector opts in by **naming** a parameter ``rx_radio_id``, and is called
+# with it by keyword. Counting positional parameters instead would misread
+# ``def choose(data, options=DEFAULTS)`` -- a perfectly ordinary one-argument
+# selector -- as context-aware, hand it a radio id where it expected its own
+# default, and reject whatever came back.
 LegacyTxSelector = Callable[[bytes], Optional[str]]
-ContextTxSelector = Callable[[bytes, Optional[str]], Optional[str]]
+ContextTxSelector = Callable[..., Optional[str]]
 TxSelector = Union[LegacyTxSelector, ContextTxSelector]
 
 
 def _selector_takes_rx(selector: Optional[TxSelector]) -> bool:
-    """Whether ``selector`` wants the ingress radio id as a second argument.
+    """Whether ``selector`` names ``rx_radio_id`` and so wants to be told it.
+
+    Deliberately name-based, matching how the Dispatcher decides whether to
+    offer the same keyword to a radio. Arity is not evidence of intent: a
+    second parameter with a default belongs to the selector, not to us, and
+    ``*args``/``**kwargs`` would swallow anything offered without meaning it.
 
     Decided from the signature once, rather than by calling with two arguments
     and retrying on TypeError: a TypeError raised *inside* a context-aware
@@ -48,7 +59,7 @@ def _selector_takes_rx(selector: Optional[TxSelector]) -> bool:
     if selector is None:
         return False
     try:
-        params = list(inspect.signature(selector).parameters.values())
+        params = inspect.signature(selector).parameters
     except (TypeError, ValueError):
         # Builtins and other C callables have no introspectable signature.
         # One argument is what every selector written before this existed
@@ -59,13 +70,8 @@ def _selector_takes_rx(selector: Optional[TxSelector]) -> bool:
         )
         return False
 
-    positional = 0
-    for param in params:
-        if param.kind is param.VAR_POSITIONAL:
-            return True
-        if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD):
-            positional += 1
-    return positional >= 2
+    param = params.get("rx_radio_id")
+    return param is not None and param.kind is not inspect.Parameter.POSITIONAL_ONLY
 
 
 class RFFabric:
@@ -172,10 +178,10 @@ class RFFabric:
     def set_tx_selector(self, selector: Optional[TxSelector]) -> None:
         """Optional policy choosing the TX radio when none is named explicitly.
 
-        Accepts either ``selector(data) -> radio_id | None`` or
-        ``selector(data, rx_radio_id) -> radio_id | None``; the second also
-        sees the radio the frame arrived on. Which one this is is settled here,
-        not at send time.
+        Accepts either ``selector(data) -> radio_id | None`` or a selector that
+        names an ``rx_radio_id`` parameter, which is passed by keyword and
+        carries the radio the frame arrived on. Which one this is is settled
+        here, not at send time.
         """
         self._tx_selector = selector
         self._tx_selector_takes_rx = _selector_takes_rx(selector)
@@ -319,9 +325,9 @@ class RFFabric:
             return radio_id
         if self._tx_selector is not None:
             if self._tx_selector_takes_rx:
-                selected = self._tx_selector(data, rx_radio_id)  # type: ignore[call-arg]
+                selected = self._tx_selector(data, rx_radio_id=rx_radio_id)
             else:
-                selected = self._tx_selector(data)  # type: ignore[call-arg]
+                selected = self._tx_selector(data)
             if selected is not None:
                 if selected not in self._radios:
                     raise KeyError(f"TX selector returned unknown radio_id={selected!r}")
