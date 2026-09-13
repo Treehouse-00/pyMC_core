@@ -36,6 +36,30 @@ from .handlers import (
 
 ACK_TIMEOUT = 5.0  # seconds to wait for an ACK
 
+
+def _names_keyword(fn: Any, name: str) -> bool:
+    """Whether ``fn`` names ``name`` in its own signature as a keyword.
+
+    Deliberately strict: a ``**kwargs`` wrapper or a test double would swallow
+    any keyword offered to it, and a radio that merely tolerates an argument is
+    not a radio that does anything with it. Only a signature that names the
+    parameter counts, so radios written before it existed -- and every mock in
+    every existing test -- keep being called exactly as they were.
+
+    Asked of the signature rather than by calling and catching TypeError: a
+    TypeError raised inside the radio's own send would otherwise read as "does
+    not accept this keyword", and the retry would re-send a packet already on
+    the air.
+    """
+    target = getattr(fn, "__func__", fn)
+    try:
+        params = inspect.signature(target).parameters
+    except (TypeError, ValueError):
+        return False
+    param = params.get(name)
+    return param is not None and param.kind is not inspect.Parameter.POSITIONAL_ONLY
+
+
 # Distinguish direct processing from a callback that captured an unknown ingress.
 _RX_RADIO_ID_UNSET = object()
 
@@ -1119,12 +1143,18 @@ class Dispatcher:
             self._discard_ack_waiter(ack_crc, ack_event)
 
     def _resolve_tx_radio_id_for_log(
-        self, raw: bytes, radio_id: Optional[str] = None
+        self,
+        raw: bytes,
+        radio_id: Optional[str] = None,
+        rx_radio_id: Optional[str] = None,
     ) -> Optional[str]:
         """Best-effort TX radio id for log lines (multi-radio / fabric).
 
         Prefers an explicit ``radio_id``, then RFFabric.resolve_tx_radio_id /
         default_radio_id when the radio is a FabricRadio or exposes a fabric.
+        ``rx_radio_id`` is handed to the fabric when it can take it, so the log
+        names the radio the send will actually use rather than the one a
+        selector reading the fabric's latest RX would have named.
         Returns None for legacy single-radio stacks so logs stay unchanged.
         """
         if radio_id is not None and str(radio_id).strip():
@@ -1142,8 +1172,12 @@ class Dispatcher:
             return None
 
         try:
-            if hasattr(fabric, "resolve_tx_radio_id"):
-                rid = fabric.resolve_tx_radio_id(raw, None)
+            resolve = getattr(fabric, "resolve_tx_radio_id", None)
+            if resolve is not None:
+                if rx_radio_id is not None and _names_keyword(resolve, "rx_radio_id"):
+                    rid = resolve(raw, None, rx_radio_id=rx_radio_id)
+                else:
+                    rid = resolve(raw, None)
                 if rid:
                     return str(rid)
         except Exception:
@@ -1192,17 +1226,27 @@ class Dispatcher:
         self.state = DispatcherState.TRANSMIT
         raw = packet.write_to()
         tx_metadata = None
+        # The radio this packet arrived on, so a multi-radio TX policy can route
+        # by where it came from instead of by whatever arrived most recently.
+        # None for anything this node originated.
+        rx_radio_id = getattr(packet, "_rx_radio_id", None)
         # Resolve which fabric/radio endpoint will TX for log clarity (multi-radio).
-        tx_radio_id = self._resolve_tx_radio_id_for_log(raw, radio_id)
+        tx_radio_id = self._resolve_tx_radio_id_for_log(raw, radio_id, rx_radio_id)
         try:
             # Prefer fabric/radio multi-radio send(data, radio_id=...) when
             # available; fall back to the legacy single-arg send(raw).
             send_fn = self.radio.send
+            pass_rx = rx_radio_id is not None and _names_keyword(send_fn, "rx_radio_id")
             if radio_id is not None:
                 try:
-                    tx_metadata = await send_fn(raw, radio_id=radio_id)
+                    if pass_rx:
+                        tx_metadata = await send_fn(raw, radio_id=radio_id, rx_radio_id=rx_radio_id)
+                    else:
+                        tx_metadata = await send_fn(raw, radio_id=radio_id)
                 except TypeError:
                     tx_metadata = await send_fn(raw)
+            elif pass_rx:
+                tx_metadata = await send_fn(raw, rx_radio_id=rx_radio_id)
             else:
                 tx_metadata = await send_fn(raw)
         except Exception as e:

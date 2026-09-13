@@ -7,16 +7,65 @@ explicit radio for TX. Each physical callback yields one ``RFIngress`` with one
 
 from __future__ import annotations
 
+import inspect
 import logging
 from collections import OrderedDict
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, Union
 
 from .models import RadioReception, RFIngress
 
 logger = logging.getLogger("RFFabric")
 
 LegacyRxCallback = Callable[..., Any]
-TxSelector = Callable[[bytes], Optional[str]]
+
+# A TX selector names the radio that should carry a frame. Two shapes are
+# accepted, and which one a selector is gets decided once, when it is
+# registered:
+#
+#     selector(data)                  the original shape, unchanged
+#     selector(data, rx_radio_id)     also told the radio the frame arrived on,
+#                                     or None when this node originated it
+#
+# The second shape exists so a selector can be a pure function of the packet in
+# front of it. One that reaches for ``last_rx_radio_id`` instead is answering
+# about whatever arrived most recently, which after a retransmit delay need not
+# be this packet -- on a busy dual-band node that puts traffic on the wrong
+# band. Being a pure function also means a caller can ask
+# ``resolve_tx_radio_id`` before the send and rely on the answer.
+LegacyTxSelector = Callable[[bytes], Optional[str]]
+ContextTxSelector = Callable[[bytes, Optional[str]], Optional[str]]
+TxSelector = Union[LegacyTxSelector, ContextTxSelector]
+
+
+def _selector_takes_rx(selector: Optional[TxSelector]) -> bool:
+    """Whether ``selector`` wants the ingress radio id as a second argument.
+
+    Decided from the signature once, rather than by calling with two arguments
+    and retrying on TypeError: a TypeError raised *inside* a context-aware
+    selector would be indistinguishable from one raised by calling it wrongly,
+    and the retry would then call it wrongly for real.
+    """
+    if selector is None:
+        return False
+    try:
+        params = list(inspect.signature(selector).parameters.values())
+    except (TypeError, ValueError):
+        # Builtins and other C callables have no introspectable signature.
+        # One argument is what every selector written before this existed
+        # expects, so that is the safe reading.
+        logger.debug(
+            "TX selector %r has no readable signature; passing data only",
+            getattr(selector, "__name__", selector),
+        )
+        return False
+
+    positional = 0
+    for param in params:
+        if param.kind is param.VAR_POSITIONAL:
+            return True
+        if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD):
+            positional += 1
+    return positional >= 2
 
 
 class RFFabric:
@@ -29,6 +78,7 @@ class RFFabric:
         self._ingress_callback: Optional[Callable[[RFIngress], Any]] = None
         self._legacy_rx_callback: Optional[LegacyRxCallback] = None
         self._tx_selector: Optional[TxSelector] = None
+        self._tx_selector_takes_rx = False
         self._armed = False
         # Latest delivered reception metrics (for FabricRadio get_last_*).
         self._last_rssi: int = 0
@@ -120,8 +170,15 @@ class RFFabric:
         self._default_radio_id = radio_id
 
     def set_tx_selector(self, selector: Optional[TxSelector]) -> None:
-        """Optional policy: ``selector(data) -> radio_id | None`` for default TX."""
+        """Optional policy choosing the TX radio when none is named explicitly.
+
+        Accepts either ``selector(data) -> radio_id | None`` or
+        ``selector(data, rx_radio_id) -> radio_id | None``; the second also
+        sees the radio the frame arrived on. Which one this is is settled here,
+        not at send time.
+        """
         self._tx_selector = selector
+        self._tx_selector_takes_rx = _selector_takes_rx(selector)
 
     # ------------------------------------------------------------------
     # Callbacks / arming
@@ -241,14 +298,30 @@ class RFFabric:
     # TX
     # ------------------------------------------------------------------
 
-    def resolve_tx_radio_id(self, data: bytes, radio_id: Optional[str] = None) -> str:
-        """Choose which registered radio should transmit ``data``."""
+    def resolve_tx_radio_id(
+        self,
+        data: bytes,
+        radio_id: Optional[str] = None,
+        *,
+        rx_radio_id: Optional[str] = None,
+    ) -> str:
+        """Choose which registered radio should transmit ``data``.
+
+        ``rx_radio_id`` is the radio the frame arrived on, or None when this
+        node originated it. It is passed to a context-aware selector, which
+        makes the answer a function of the arguments alone: ask before the send
+        and the send will agree. Selectors of the original one-argument shape
+        never see it and behave exactly as they did.
+        """
         if radio_id is not None:
             if radio_id not in self._radios:
                 raise KeyError(f"Unknown radio_id={radio_id!r}")
             return radio_id
         if self._tx_selector is not None:
-            selected = self._tx_selector(data)
+            if self._tx_selector_takes_rx:
+                selected = self._tx_selector(data, rx_radio_id)  # type: ignore[call-arg]
+            else:
+                selected = self._tx_selector(data)  # type: ignore[call-arg]
             if selected is not None:
                 if selected not in self._radios:
                     raise KeyError(f"TX selector returned unknown radio_id={selected!r}")
@@ -258,14 +331,23 @@ class RFFabric:
             raise RuntimeError("RFFabric has no registered radio")
         return default
 
-    async def send(self, data: bytes, *, radio_id: Optional[str] = None) -> Any:
+    async def send(
+        self,
+        data: bytes,
+        *,
+        radio_id: Optional[str] = None,
+        rx_radio_id: Optional[str] = None,
+    ) -> Any:
         """Transmit via default, selector, or explicit ``radio_id``.
+
+        ``rx_radio_id`` names the radio the frame arrived on and is only read by
+        a context-aware selector; an explicit ``radio_id`` still wins outright.
 
         When the physical radio returns a dict metadata blob, attach
         ``radio_id`` so callers (Dispatcher TX logs) know which endpoint TX'd.
         Non-dict results are returned unchanged for legacy radios.
         """
-        rid = self.resolve_tx_radio_id(data, radio_id)
+        rid = self.resolve_tx_radio_id(data, radio_id, rx_radio_id=rx_radio_id)
         radio = self._radios[rid]
         if not hasattr(radio, "send"):
             raise RuntimeError(f"Radio {rid!r} ({type(radio).__name__}) does not support send()")

@@ -98,8 +98,28 @@ class FabricRadio(LoRaRadio):
             return True
         return all(r is None or bool(r) for _, r in results)
 
-    async def send(self, data: bytes, *, radio_id: Optional[str] = None) -> Any:
-        return await self.fabric.send(data, radio_id=radio_id)
+    async def send(
+        self,
+        data: bytes,
+        *,
+        radio_id: Optional[str] = None,
+        rx_radio_id: Optional[str] = None,
+    ) -> Any:
+        return await self.fabric.send(data, radio_id=radio_id, rx_radio_id=rx_radio_id)
+
+    def resolve_tx_radio_id(
+        self,
+        data: bytes,
+        radio_id: Optional[str] = None,
+        *,
+        rx_radio_id: Optional[str] = None,
+    ) -> str:
+        """Which radio would carry ``data``, without sending it.
+
+        Named here rather than left to ``__getattr__`` so callers can check for
+        the keyword on the adapter they hold.
+        """
+        return self.fabric.resolve_tx_radio_id(data, radio_id, rx_radio_id=rx_radio_id)
 
     async def wait_for_rx(self) -> bytes:
         radio = self.fabric.radio
