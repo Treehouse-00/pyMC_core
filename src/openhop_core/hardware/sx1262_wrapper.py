@@ -2129,6 +2129,118 @@ class SX1262Radio(LoRaRadio):
                 if acquired_tx_lock and self._tx_lock.locked():
                     self._tx_lock.release()
 
+    async def measure_rssi_dwell(
+        self,
+        freq_hz: int,
+        dwell_s: float = 0.4,
+        sample_gap_s: float = 0.0007,
+        settle_s: float = 0.02,
+        respect_tx_lock: bool = True,
+        lock_timeout: float = 5.0,
+    ) -> dict:
+        """
+        Listen on one frequency and return every instantaneous RSSI sample heard.
+
+        This is the measurement half of a spectrum sweep. The radio is retuned to
+        freq_hz, put into RX_CONTINUOUS, and GetRssiInst is polled every
+        sample_gap_s until dwell_s has elapsed. The samples come back raw so the
+        caller can derive its own statistics; nothing is averaged here.
+
+        The mesh is off the air for the dwell: the TX lock is held so the
+        dispatcher cannot transmit on the wrong frequency, and the DIO IRQ routes
+        are disabled so the interrupt handler does not fire on off-channel
+        traffic. The original frequency and RX IRQ routes are restored in the
+        finally block whatever happens, and self.frequency is never touched, so
+        status readers keep reporting the configured mesh frequency throughout.
+
+        Readings >= -1 dBm or <= -126 dBm are unsettled front-end or bus noise
+        and are counted in `discarded` rather than returned.
+
+        Returns:
+            dict: {"freq_hz", "dwell_s", "started_ts", "n", "samples", "discarded"}
+                  on success, or {"error": <reason>} if the radio could not be
+                  taken (for example, a transmit held the lock past lock_timeout).
+        """
+        if not self._initialized:
+            raise RuntimeError("Radio not initialized")
+
+        if not self.lora:
+            raise RuntimeError("LoRa radio object not available")
+
+        acquired_tx_lock = False
+        if respect_tx_lock:
+            try:
+                await asyncio.wait_for(self._tx_lock.acquire(), timeout=lock_timeout)
+                acquired_tx_lock = True
+            except asyncio.TimeoutError:
+                return {"error": "waited_for_tx_lock_timeout", "freq_hz": int(freq_hz)}
+
+        original_freq = self.frequency
+        samples: list[float] = []
+        discarded = 0
+        started_ts = time.time()
+
+        try:
+            # The RX buffer is about to be reused on another frequency: read out
+            # a packet whose RX_DONE is latched first, the same as before a CAD.
+            await self._drain_pending_rx_irq_before_buffer_reuse()
+            self.lora.setStandby(self.lora.STANDBY_RC)
+            await asyncio.sleep(self.RADIO_TIMING_DELAY)
+
+            # Retune the chip directly. self.set_frequency would also update
+            # self.frequency, which must keep reporting the mesh channel.
+            self.lora.setFrequency(int(freq_hz))
+            self._control_tx_rx_pins(tx_mode=False)
+            self.lora.request(self.lora.RX_CONTINUOUS)
+            # request() arms the full RX IRQ mask on its way into RX, so the
+            # routes are quieted after it, not before: GetRssiInst needs the
+            # chip in RX, and an off-channel preamble must not wake the handler
+            # mid-dwell.
+            self.lora.setDioIrqParams(
+                self.lora.IRQ_NONE,
+                self.lora.IRQ_NONE,
+                self.lora.IRQ_NONE,
+                self.lora.IRQ_NONE,
+            )
+            await asyncio.sleep(max(0.0, float(settle_s)))
+
+            deadline = time.monotonic() + max(0.0, float(dwell_s))
+            while time.monotonic() < deadline:
+                raw = self.lora.getRssiInst()
+                if raw is None:
+                    discarded += 1
+                else:
+                    value = -(float(raw) / 2.0)
+                    if value >= -1.0 or value <= -126.0:
+                        discarded += 1
+                    else:
+                        samples.append(value)
+                await asyncio.sleep(max(0.0, float(sample_gap_s)))
+
+            return {
+                "freq_hz": int(freq_hz),
+                "dwell_s": float(dwell_s),
+                "started_ts": started_ts,
+                "n": len(samples),
+                "samples": samples,
+                "discarded": discarded,
+            }
+        finally:
+            try:
+                # Back to the mesh channel before the RX routes come up, so the
+                # first packet the handler sees is on the right frequency; then
+                # the same RX restore a transmit ends with.
+                self.lora.setStandby(self.lora.STANDBY_RC)
+                await asyncio.sleep(self.RADIO_TIMING_DELAY)
+                self.lora.setFrequency(int(original_freq))
+                if acquired_tx_lock or not self._tx_lock.locked():
+                    await self._restore_rx_mode()
+            except Exception as e:
+                logger.warning(f"Failed to restore RX mode after RSSI dwell: {e}")
+            finally:
+                if acquired_tx_lock and self._tx_lock.locked():
+                    self._tx_lock.release()
+
     def _bind_instance_spi_transport(self) -> None:
         """Attach a per-instance SPI transport when possible.
 
