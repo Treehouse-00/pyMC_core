@@ -702,7 +702,7 @@ class Dispatcher:
         if forward_pkt is not None and not (
             forward_pkt.is_route_flood() and pkt.is_marked_do_not_retransmit()
         ):
-            asyncio.create_task(self._client_repeat_transmit(forward_pkt))
+            asyncio.create_task(self._client_repeat_transmit(forward_pkt, received_pkt=pkt))
 
     # ------------------------------------------------------------------
     # Public interface - sending and receiving packets
@@ -1041,14 +1041,25 @@ class Dispatcher:
             return 0.0
         return float(random.randint(0, int(5 * t)))
 
-    async def _client_repeat_transmit(self, pkt: Packet) -> None:
+    async def _client_repeat_transmit(
+        self, pkt: Packet, *, received_pkt: Optional[Packet] = None
+    ) -> None:
         """Wait out the retransmit jitter then send the forward through the funnel.
 
         Stage 2 airtime budgeting slots in here / in the send funnel: the
         forward is a plain send_packet, so a budget gate can suppress it.
         """
         try:
-            delay_ms = self._client_repeat_delay_ms(pkt)
+            # Direct jitter uses the path before stripping self (MeshCore 1.18).
+            # Flood and TRACE jitter use the forwarded path after appending self.
+            delay_packet = (
+                received_pkt
+                if pkt.is_route_direct()
+                and pkt.get_payload_type() != PAYLOAD_TYPE_TRACE
+                and received_pkt is not None
+                else pkt
+            )
+            delay_ms = self._client_repeat_delay_ms(delay_packet)
             if delay_ms > 0:
                 await asyncio.sleep(delay_ms / 1000.0)
             await self.send_packet(pkt, wait_for_ack=False)

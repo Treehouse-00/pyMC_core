@@ -1660,8 +1660,8 @@ async def test_cmd_send_anon_req_success_writes_sent():
     assert 0x11223344 in server._companion_binary_tags
 
 
-def test_binary_response_push_only_for_owned_tag():
-    """Unowned non-region responses are ignored; owned and region responses pass."""
+def test_binary_response_push_preserves_request_ownership():
+    """Other servers' matched requests stay private; unsolicited responses pass."""
     bridge = Mock()
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=16)
@@ -1677,9 +1677,14 @@ def test_binary_response_push_only_for_owned_tag():
     tag = 0x11223344
     tag_bytes = struct.pack("<I", tag)
 
-    # Unowned response is ignored.
-    on_binary(tag_bytes, b"\xaa\xbb")
+    # A matched request from another server is ignored.
+    on_binary(tag_bytes, b"\xaa\xbb", None, 6)
     assert server._write_queue.qsize() == 0
+
+    on_binary(tag_bytes, b"\xaa\xbb")
+    assert server._write_queue.get_nowait()[3:] == (
+        bytes([PUSH_CODE_BINARY_RESPONSE, 0]) + tag_bytes + b"\xaa\xbb"
+    )
 
     # Unowned regions response is allowed for compatibility.
     on_binary(tag_bytes, b"\xaa\xbb", {"type": "regions"}, 7)
