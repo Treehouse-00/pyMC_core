@@ -139,6 +139,10 @@ class CompanionRadio(CompanionBase):
     def _get_text_handler(self) -> Any:
         return self.node.dispatcher.text_message_handler
 
+    def _apply_multi_acks_pref(self) -> None:
+        super()._apply_multi_acks_pref()
+        self.node.dispatcher.set_multi_acks(self.prefs.multi_acks)
+
     def _get_advert_handler(self) -> Any:
         return self.node.dispatcher._handler_instances.get(PAYLOAD_TYPE_ADVERT)
 

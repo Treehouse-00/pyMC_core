@@ -35,7 +35,7 @@ Core keeps its own product/version metadata.
 | Companion CLI, remote CLI permission, PIN/time-zone preferences, reboot, encoded raw paths, and channel-data bounds | Already covered by the previous compatibility work and existing tests. |
 | `MAX_SEARCH_RESULTS` increases from 8 to 24 (`f9e70426a`) | Core already tries all matching contacts; it has no eight-contact search cap. |
 | Ordinary direct ACK forwarding uses retransmit jitter (`6df5aaed4`) | Core already delayed client-repeat ACK forwards; the new change aligns the path length used to calculate that delay. |
-| Multipart ACK forwarding and regenerated multi-ACK timing | Core's generic client-repeat forwarding predates this release and does not regenerate the firmware's multi-ACK sequence. This existing divergence needs separate routing work; the ordinary ACK delay observation does not establish multipart parity. |
+| Multipart ACK forwarding and regenerated multi-ACK timing | Client-repeat regenerates the local configured ACK sequence, using unwrapped multipart duplicate claims and the firmware's remaining-count delay. See [client-repeat ACKs](client-repeat-acks.md) for timing and validation limits. |
 | Hidden repeaters stop answering discovery (`f19733e47`) | Advertisement scheduling and discovery response policy belong to the Repeater application. Core's control handler parses and dispatches requests; it does not decide whether a repeater advertises. |
 | Room `set repeat on` deprecated | Room CLI policy belongs to the Repeater application; no matching Core command. |
 | CommonCLI `power` and GPS diagnostics, board/driver fixes, Wi-Fi/BLE, retained MCU clock | Hardware/firmware or Repeater command surfaces, outside this Python Core change. |
@@ -46,8 +46,6 @@ Core keeps its own product/version metadata.
 These were present before the compatibility changes; they remain separate from
 this release delta:
 
-- Client-repeat forwards multipart ACKs verbatim instead of regenerating a
-  firmware-style multi-ACK sequence, as noted above.
 - Core sends cached contact shares as plain DIRECT. Firmware marks shares as
   TRANSPORT_DIRECT with zero transport codes, distinguishing shares from
   ordinary adverts. This firmware behavior predates `618b2ef4`.
@@ -71,7 +69,10 @@ wildcard reply scope, and complete/incomplete AES blocks.
 
 Validation on Python 3.12:
 
-- Core suite: **2,637 passed**.
+- Core suite: **2,761 passed**, including the separate client-repeat ACK follow-up.
+- ACK regeneration: **124 new tests**, plus **26 existing forwarding tests**,
+  cover sequence deadlines, both direct route forms, path widths, canonical
+  claims, late plain ACKs, payload bounds, preference wiring, and cancellation.
 - Focused release-delta files contain **581 passing tests** within the full suite.
 - Downstream Repeater bridge/preferences/callback/policy tests: **44 passed**
   against Repeater `3c4bf3a`, with this Core source on `PYTHONPATH`.
