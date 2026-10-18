@@ -24,6 +24,7 @@ The source comparison covers `src/`, `examples/companion_radio/`,
 | Transport code zero means wildcard (`01f9293be`, `RegionMap::findMatch`). | Return the wildcard for a transport-routed packet with first code zero. Reply-scope capture mirrors it as unscoped, overriding any default region. Like firmware, this early return does not consult the wildcard deny flag. Plain FLOOD handling is unchanged. |
 | Reject ciphertext that is not a whole number of AES blocks (`9c9a2ba2d`, `b74ba5453`, `Utils::MACThenDecrypt`). | Reject before HMAC or decryption instead of padding malformed ciphertext. Valid encrypted packets retain their existing zero padding. |
 | Direct ACK jitter uses the received path length (`6df5aaed4`, `Mesh::onRecvPacket`). | Compute direct-forward jitter before removing this node's path hash. Flood forwards continue using the path after appending this node. |
+| Contact shares use TRANSPORT_DIRECT with zero transport codes (`BaseChatMesh::shareContactZeroHop`, predating `618b2ef4`). | Replay the cached signed advert with that marker and an empty path, preserving the payload and cached bytes. |
 
 The companion protocol version stays **14**: the release does not change it.
 Core keeps its own product/version metadata.
@@ -46,9 +47,6 @@ Core keeps its own product/version metadata.
 These were present before the compatibility changes; they remain separate from
 this release delta:
 
-- Core sends cached contact shares as plain DIRECT. Firmware marks shares as
-  TRANSPORT_DIRECT with zero transport codes, distinguishing shares from
-  ordinary adverts. This firmware behavior predates `618b2ef4`.
 - As in firmware, a pending login takes priority for an authenticated response
   from that same contact when no known request tag disambiguates it. An
   unsolicited telemetry push can therefore be interpreted as a login outcome.
@@ -69,10 +67,14 @@ wildcard reply scope, and complete/incomplete AES blocks.
 
 Validation on Python 3.12:
 
-- Core suite: **2,761 passed**, including the separate client-repeat ACK follow-up.
+- ACK branch before integrating the contact-share follow-up: **2,761 passed**.
 - ACK regeneration: **124 new tests**, plus **26 existing forwarding tests**,
   cover sequence deadlines, both direct route forms, path widths, canonical
   claims, late plain ACKs, payload bounds, preference wiring, and cancellation.
+- Compatibility branch including the contact-share follow-up: **2,640 passed**.
+- Contact sharing: four cached-route variants preserve the signed payload and
+  cached bytes, emit zero transport codes and path length, and round-trip through
+  the wire parser. All four fail with the old DIRECT marker.
 - Focused release-delta files contain **581 passing tests** within the full suite.
 - Downstream Repeater bridge/preferences/callback/policy tests: **44 passed**
   against Repeater `3c4bf3a`, with this Core source on `PYTHONPATH`.
