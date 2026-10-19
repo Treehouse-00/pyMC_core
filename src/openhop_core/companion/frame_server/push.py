@@ -235,11 +235,12 @@ class _PushMixin:
             except (TypeError, ValueError):
                 return
         if tag_int not in self._companion_binary_tags:
-            # Region discovery replies can be generated outside this
-            # frame-server request path; allow those through for parity
-            # with pre-owner-tag behavior while keeping other responses
-            # isolated to the requesting virtual companion.
-            if not (isinstance(parsed, dict) and parsed.get("type") == "regions"):
+            # MeshCore 1.18 sends unmatched responses (including sensor pushes)
+            # to the app. Matched requests owned by another frame server stay
+            # isolated; regions retain their existing compatibility exception.
+            if request_type is not None and not (
+                isinstance(parsed, dict) and parsed.get("type") == "regions"
+            ):
                 return
         else:
             self._companion_binary_tags.discard(tag_int)

@@ -1277,6 +1277,16 @@ class TestGroupTextHandler:
         """Test group text handler payload type."""
         assert GroupTextHandler.payload_type() == PAYLOAD_TYPE_GRP_TXT
 
+    @pytest.mark.parametrize("size", [0, 1, 15, 17, 31, 63])
+    def test_partial_ciphertext_rejected_before_hmac_without_error_log(self, size):
+        from unittest.mock import patch
+
+        with patch.object(CryptoUtils, "_hmac_sha256") as hmac_fn:
+            plaintext = self.handler._decrypt_channel_message("00" * 16, b"\x00\x00", bytes(size))
+            assert plaintext is None
+            hmac_fn.assert_not_called()
+        self.log_fn.assert_not_called()
+
     def test_group_text_handler_initialization(self):
         """Test group text handler initialization."""
         assert self.handler.local_identity == self.local_identity
